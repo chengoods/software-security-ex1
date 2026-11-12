@@ -8,6 +8,7 @@ from application_protocols import parse_dns, parse_dns_tcp_stream, parse_http_st
 from process_connections import Owner
 from protocols import decode
 from tcp_streams import FlowTracker
+from app import stream_preview
 
 
 def packet(src, dst, sport, dport, seq, flags, payload=b""):
@@ -17,6 +18,17 @@ def packet(src, dst, sport, dport, seq, flags, payload=b""):
 
 
 class NpaTests(unittest.TestCase):
+    def test_stream_preview_uses_hex_for_binary(self):
+        label, preview = stream_preview(b"POST / HTTP/1.1\r\n\r\n\x00\xff\x01")
+        self.assertIn("十六进制", label)
+        self.assertIn("50 4f 53 54", preview)
+        self.assertNotIn("\ufffd", preview)
+
+    def test_stream_preview_keeps_readable_text(self):
+        label, preview = stream_preview("GET / HTTP/1.1\r\n备注: 测试\r\n".encode("utf-8"))
+        self.assertIn("UTF-8", label)
+        self.assertIn("备注: 测试", preview)
+
     def test_reorder_retransmit_bidirectional_http(self):
         tracker = FlowTracker()
         a, b = "192.0.2.1", "198.51.100.2"

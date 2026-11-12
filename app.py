@@ -40,6 +40,21 @@ def hex_dump(data: bytes) -> str:
     return "\n".join(lines)
 
 
+def stream_preview(data: bytes) -> tuple[str, str]:
+    if not data:
+        return "连续载荷为空", ""
+    try:
+        text = data[:65536].decode("utf-8")
+        if all(char.isprintable() or char in "\r\n\t" for char in text):
+            suffix = "\n…（预览限前 64 KiB）" if len(data) > 65536 else ""
+            return "连续载荷（UTF-8 文本）", text + suffix
+    except UnicodeDecodeError:
+        pass
+    preview = data[:4096]
+    suffix = "\n…（十六进制预览限前 4 KiB）" if len(data) > len(preview) else ""
+    return "连续载荷（二进制，十六进制 / ASCII）", hex_dump(preview) + suffix
+
+
 class SnifferApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -335,17 +350,23 @@ class SnifferApp(tk.Tk):
         process_box = ttk.Combobox(top, textvariable=process_filter, width=34, state="readonly")
         process_box.pack(side="left", padx=(5, 12))
         columns = ("id", "endpoint_a", "endpoint_b", "process", "packets", "bytes", "http")
-        table = ttk.Treeview(window, columns=columns, show="headings", height=10, selectmode="browse")
+        list_frame = ttk.Frame(window)
+        list_frame.pack(fill="x", padx=8)
+        table = ttk.Treeview(list_frame, columns=columns, show="headings", height=10, selectmode="browse")
         for key, label, width in zip(columns, ("流", "端点 A", "端点 B", "进程 / PID", "包数", "载荷字节", "HTTP 消息"), (50, 180, 180, 230, 70, 100, 100)):
             table.heading(key, text=label)
             table.column(key, width=width, stretch=key.startswith("endpoint"))
-        table.pack(fill="x", padx=8)
+        table.pack(side="left", fill="x", expand=True)
+        list_scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=table.yview)
+        list_scrollbar.pack(side="right", fill="y")
+        table.configure(yscrollcommand=list_scrollbar.set)
         detail = tk.Text(window, font=("Consolas", 10), wrap="none", state="disabled")
         detail.pack(fill="both", expand=True, padx=8, pady=8)
 
         def refresh() -> None:
             choice = process_filter.get()
             selection = table.selection()
+            scroll_position = table.yview()[0]
             owners = {f"{owner.name} (PID {owner.pid})" for flow in self.flows.flows for owner in flow.owners.values()}
             choices = ["全部", "未知进程"] + sorted(owners)
             process_box["values"] = choices
@@ -367,6 +388,8 @@ class SnifferApp(tk.Tk):
             if selection and table.exists(selection[0]):
                 table.selection_set(selection[0])
                 table.focus(selection[0])
+                select()
+            table.yview_moveto(scroll_position)
 
         def select(_event=None) -> None:
             selected = table.selection()
@@ -396,7 +419,8 @@ class SnifferApp(tk.Tk):
                     for summary, fields in parse_dns_tcp_stream(data):
                         lines.append(f"DNS over TCP: {summary}")
                         lines += [f"  {name}: {value}" for name, value in fields]
-                lines += ["", "--- 连续载荷（前 64 KiB，文本预览） ---", data[:65536].decode("utf-8", "replace")]
+                preview_label, preview_text = stream_preview(data)
+                lines += ["", f"--- {preview_label} ---", preview_text]
             detail.configure(state="normal")
             detail.delete("1.0", "end")
             detail.insert("1.0", "\n".join(lines))
