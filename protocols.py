@@ -153,8 +153,8 @@ def decode(raw: bytes, linktype: int = 1) -> Decoded:
             fragmented = bool(frag & 0x3FFF)
             end = min(len(raw), at + total)
             at += ihl
-            if frag & 0x1FFF:
-                out.protocol, out.info = "IPv4", "Noninitial fragment"
+            if fragmented:
+                out.protocol, out.info = "IPv4", "Fragment offset=%d more=%s" % ((frag & 0x1FFF) * 8, bool(frag & 0x2000))
                 return out
         elif kind == 0x86DD:
             if len(raw) < at + 40 or raw[at] >> 4 != 6:
@@ -178,11 +178,11 @@ def decode(raw: bytes, linktype: int = 1) -> Decoded:
                 size = 8 if proto == 44 else (raw[at + 1] + (2 if proto == 51 else 1)) * (4 if proto == 51 else 8)
                 if size < 8 or at + size > end:
                     raise ValueError("invalid IPv6 extension")
-                if proto == 44 and struct.unpack_from("!H", raw, at + 2)[0] & 0xFFF8:
-                    out.protocol, out.info = "IPv6", "Noninitial fragment"
-                    return out
                 if proto == 44:
-                    fragmented = bool(raw[at + 3] & 1)
+                    offset_flags = struct.unpack_from("!H", raw, at + 2)[0]
+                    if offset_flags & 0xFFF9:
+                        out.protocol, out.info = "IPv6", "Fragment offset=%d more=%s" % (offset_flags & 0xFFF8, bool(offset_flags & 1))
+                        return out
                 out.details.append(("IPv6 extension", f"type={proto} bytes={size}"))
                 proto, at = next_proto, at + size
         else:

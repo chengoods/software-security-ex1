@@ -17,6 +17,7 @@ from tcp_streams import FlowTracker
 from application_protocols import parse_dns_tcp_stream, parse_http_stream
 from process_connections import ProcessConnections
 from display_expression import compile_display_expression
+from ip_fragments import FragmentReassembler
 
 
 MAX_PACKETS = 20000
@@ -66,6 +67,7 @@ class SnifferApp(tk.Tk):
         self.devices = []
         self.packets: list[Packet] = []
         self.flows = FlowTracker()
+        self.fragments = FragmentReassembler()
         self.linktype = 1
         self.events: queue.Queue = queue.Queue(maxsize=5000)
         self.stop_event = threading.Event()
@@ -296,6 +298,13 @@ class SnifferApp(tk.Tk):
                     decoded = decode(data, self.linktype)
                     index = len(self.packets)
                     self.packets.append(Packet(stamp, data, original, decoded))
+                    completed = self.fragments.add(stamp, index, data, self.linktype)
+                    if completed:
+                        rebuilt, indices = completed
+                        decoded = decode(rebuilt, self.linktype)
+                        decoded.details.append(("IP reassembly", "Packets: " + ", ".join(str(i + 1) for i in indices) + "; analysis uses reassembled bytes; hex view is this fragment"))
+                        self.packets[index].decoded = decoded
+                        refresh_needed = True
                     flow = self.flows.add(stamp, index, decoded)
                     if flow and self.connections:
                         self.flows.attribute_flow(flow, self.connections)
@@ -406,6 +415,7 @@ class SnifferApp(tk.Tk):
             return
         self.packets.clear()
         self.flows.clear()
+        self.fragments.clear()
         with self.connections_lock:
             self.connections = {}
             self.connections_generation += 1
@@ -436,6 +446,11 @@ class SnifferApp(tk.Tk):
             self.linktype = linktype
             self.packets = [Packet(stamp, data, original, decode(data, linktype)) for stamp, data, original in items]
             for index, packet in enumerate(self.packets):
+                completed = self.fragments.add(packet.stamp, index, packet.data, linktype)
+                if completed:
+                    rebuilt, indices = completed
+                    packet.decoded = decode(rebuilt, linktype)
+                    packet.decoded.details.append(("IP reassembly", "Packets: " + ", ".join(str(i + 1) for i in indices) + "; analysis uses reassembled bytes; hex view is this fragment"))
                 flow = self.flows.add(packet.stamp, index, packet.decoded)
                 if flow:
                     self._tag_flow_http(flow)

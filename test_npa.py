@@ -3,6 +3,7 @@
 import socket
 import struct
 import unittest
+from unittest.mock import patch
 
 from application_protocols import parse_dns, parse_dns_tcp_stream, parse_http_stream
 from process_connections import Owner
@@ -12,6 +13,7 @@ from app import stream_preview
 from app import Packet, SnifferApp
 from display_expression import compile_display_expression
 from protocols import _checksum
+from ip_fragments import FragmentReassembler
 
 
 def packet(src, dst, sport, dport, seq, flags, payload=b""):
@@ -21,6 +23,91 @@ def packet(src, dst, sport, dport, seq, flags, payload=b""):
 
 
 class NpaTests(unittest.TestCase):
+    def test_ipv4_fragments_out_of_order(self):
+        source, target = socket.inet_aton("192.0.2.1"), socket.inet_aton("198.51.100.2")
+        udp = struct.pack("!HHHH", 40000, 9999, 24, 0) + b"abcdefghijklmnop"
+
+        def frame(offset, more, payload):
+            header = bytearray(struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), 7,
+                                           offset // 8 | (0x2000 if more else 0), 64, 17, 0, source, target))
+            struct.pack_into("!H", header, 10, _checksum(header))
+            return b"\0" * 12 + b"\x08\x00" + header + payload
+
+        first, last = frame(0, True, udp[:16]), frame(16, False, udp[16:])
+        reassembler = FragmentReassembler()
+        self.assertIsNone(reassembler.add(1, 0, last, 1))
+        self.assertEqual(decode(first).protocol, "IPv4")
+        completed = reassembler.add(2, 1, first, 1)
+        self.assertEqual(completed[1], [0, 1])
+        decoded = decode(completed[0])
+        self.assertEqual(decoded.protocol, "UDP")
+        self.assertEqual(decoded.destination_port, 9999)
+        self.assertIn("valid", dict(decoded.details)["IPv4 header checksum"])
+        self.assertEqual(completed[0][-len(udp):], udp)
+
+    def test_ipv6_fragments_and_missing_piece(self):
+        source = socket.inet_pton(socket.AF_INET6, "2001:db8::1")
+        target = socket.inet_pton(socket.AF_INET6, "2001:db8::2")
+        udp = struct.pack("!HHHH", 1234, 9999, 24, 0) + b"abcdefghijklmnop"
+
+        def frame(offset, more, payload):
+            fragment = struct.pack("!BBHI", 17, 0, offset | int(more), 12345)
+            header = struct.pack("!IHBB16s16s", 0x60000000, len(fragment) + len(payload), 44, 64, source, target)
+            return b"\0" * 12 + b"\x86\xdd" + header + fragment + payload
+
+        first, last = frame(0, True, udp[:16]), frame(16, False, udp[16:])
+        reassembler = FragmentReassembler()
+        self.assertIsNone(reassembler.add(1, 0, first, 1))
+        self.assertEqual(decode(first).protocol, "IPv6")
+        completed = reassembler.add(2, 1, last, 1)
+        self.assertEqual(completed[1], [0, 1])
+        self.assertEqual(decode(completed[0]).destination_port, 9999)
+        self.assertEqual(completed[0][-len(udp):], udp)
+
+    def test_fragment_overlap_rejected(self):
+        source, target = socket.inet_aton("192.0.2.1"), socket.inet_aton("198.51.100.2")
+
+        def frame(offset, more, payload):
+            header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), 8,
+                                 offset // 8 | (0x2000 if more else 0), 64, 17, 0, source, target)
+            return b"\0" * 12 + b"\x08\x00" + header + payload
+
+        reassembler = FragmentReassembler()
+        self.assertIsNone(reassembler.add(1, 0, frame(0, True, b"abcdefghijklmnop"), 1))
+        self.assertIsNone(reassembler.add(2, 1, frame(8, False, b"XXXXXXXX"), 1))
+        self.assertFalse(reassembler.pending)
+
+    def test_offline_import_shows_reassembly_and_keeps_original_packets(self):
+        source, target = socket.inet_aton("192.0.2.1"), socket.inet_aton("198.51.100.2")
+        udp = struct.pack("!HHHH", 40000, 9999, 24, 0) + b"abcdefghijklmnop"
+
+        def frame(offset, more, payload):
+            header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), 10,
+                                 offset // 8 | (0x2000 if more else 0), 64, 17, 0, source, target)
+            return b"\0" * 12 + b"\x08\x00" + header + payload
+
+        first, last = frame(0, True, udp[:16]), frame(16, False, udp[16:])
+        records = [(1.0, last, len(last)), (2.0, first, len(first))]
+        app = SnifferApp()
+        try:
+            with patch("app.filedialog.askopenfilename", return_value="synthetic.pcap"), \
+                 patch("app.read_pcap", return_value=(1, records)):
+                app._open_file()
+            self.assertEqual(len(app.table.get_children()), 2)
+            self.assertEqual([item.data for item in app.packets], [last, first])
+            self.assertEqual(app.packets[0].decoded.protocol, "IPv4")
+            self.assertEqual(app.packets[1].decoded.protocol, "UDP")
+            self.assertIn("IP reassembly", dict(app.packets[1].decoded.details))
+            app.display_filter.set("UDP")
+            app._refresh_list()
+            self.assertEqual(len(app.table.get_children()), 1)
+            with patch("app.filedialog.asksaveasfilename", return_value="synthetic-out.pcap"), \
+                 patch("app.write_pcap") as write:
+                app._save_file()
+            self.assertEqual(list(write.call_args[0][2]), records)
+        finally:
+            app.destroy()
+
     def test_display_expression_logic_and_fields(self):
         tcp = packet("192.0.2.1", "198.51.100.2", 50000, 80, 1, 0x18)
         self.assertTrue(compile_display_expression("tcp and port 80")(tcp))
