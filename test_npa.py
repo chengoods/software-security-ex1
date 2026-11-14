@@ -9,6 +9,9 @@ from process_connections import Owner
 from protocols import decode
 from tcp_streams import FlowTracker
 from app import stream_preview
+from app import Packet, SnifferApp
+from display_expression import compile_display_expression
+from protocols import _checksum
 
 
 def packet(src, dst, sport, dport, seq, flags, payload=b""):
@@ -18,6 +21,85 @@ def packet(src, dst, sport, dport, seq, flags, payload=b""):
 
 
 class NpaTests(unittest.TestCase):
+    def test_display_expression_logic_and_fields(self):
+        tcp = packet("192.0.2.1", "198.51.100.2", 50000, 80, 1, 0x18)
+        self.assertTrue(compile_display_expression("tcp and port 80")(tcp))
+        self.assertTrue(compile_display_expression("ip.addr == 192.0.2.1 and not udp")(tcp))
+        self.assertTrue(compile_display_expression("(udp or http or tcp) and dst.port == 80")(tcp))
+        self.assertFalse(compile_display_expression("udp or tcp and port 53")(tcp))
+        with self.assertRaises(ValueError):
+            compile_display_expression("tcp and")
+
+    def test_display_filter_keeps_search_forms(self):
+        tcp = packet("192.0.2.1", "198.51.100.2", 50000, 80, 1, 0x12)
+        self.assertTrue(compile_display_expression("syn")(tcp))
+        self.assertTrue(compile_display_expression("info:SYN")(tcp))
+        self.assertTrue(compile_display_expression("info: SYN")(tcp))
+        self.assertTrue(compile_display_expression("src:192.0.2")(tcp))
+        self.assertTrue(compile_display_expression("192.0.2")(tcp))
+        self.assertTrue(compile_display_expression("tcp and info:syn")(tcp))
+        self.assertTrue(compile_display_expression("tcp and src:192.0.2")(tcp))
+        tcp.info = "SYN ACK"
+        self.assertTrue(compile_display_expression("SYN Ack")(tcp))
+        self.assertTrue(compile_display_expression("tcp")(tcp))
+        self.assertFalse(compile_display_expression("dst:192.0.2")(tcp))
+        self.assertFalse(compile_display_expression("udp and info:syn")(tcp))
+        self.assertTrue(compile_display_expression('info:"SYN"')(tcp))
+        with self.assertRaises(ValueError):
+            compile_display_expression("info:syn and")
+
+    def test_cross_packet_http_tags_only_payload_packets(self):
+        tracker = FlowTracker()
+        a, b = "192.0.2.1", "198.51.100.2"
+        request = b"GET /split HTTP/1.1\r\nHost: example.test\r\n\r\n"
+        decoded = [packet(a, b, 50000, 80, 100, 2),
+                   packet(a, b, 50000, 80, 101, 24, request[:12]),
+                   packet(a, b, 50000, 80, 113, 24, request[12:])]
+        records = [Packet(float(i), b"", 0, item) for i, item in enumerate(decoded)]
+        app = object.__new__(SnifferApp)
+        app.packets = records
+        for i, item in enumerate(decoded):
+            flow = tracker.add(float(i), i, item)
+        changed = app._tag_flow_http(flow)
+        self.assertEqual(changed, {1, 2})
+        self.assertNotIn("HTTP", records[0].decoded.tags)
+        self.assertTrue(all("HTTP" in records[i].decoded.tags for i in (1, 2)))
+
+    def test_tcp_options_and_checksum_status(self):
+        source, destination = socket.inet_aton("192.0.2.1"), socket.inet_aton("198.51.100.2")
+        options = b"\x02\x04\x05\xb4\x03\x03\x07\x01\x04\x02\x01\x01\x08\x0a" + struct.pack("!II", 123, 456) + b"\x00\x00"
+        tcp = bytearray(struct.pack("!HHIIBBHHH", 50000, 80, 100, 0, 0xB0, 2, 4096, 0, 0) + options)
+        pseudo = source + destination + struct.pack("!BBH", 0, 6, len(tcp))
+        struct.pack_into("!H", tcp, 16, _checksum(pseudo + tcp))
+        ip = bytearray(struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(tcp), 1, 0, 64, 6, 0, source, destination))
+        struct.pack_into("!H", ip, 10, _checksum(ip))
+        decoded = decode(b"\0" * 12 + b"\x08\x00" + ip + tcp)
+        fields = dict(decoded.details)
+        self.assertIn("valid", fields["IPv4 header checksum"])
+        self.assertEqual(fields["TCP checksum status"], "valid")
+        self.assertEqual(fields["TCP window"], "4096")
+        self.assertIn("MSS=1460", [value for key, value in decoded.details if key == "TCP option"])
+        self.assertIn("Window scale=7", [value for key, value in decoded.details if key == "TCP option"])
+        self.assertIn("SACK permitted", [value for key, value in decoded.details if key == "TCP option"])
+        self.assertTrue(any("Timestamp TSval=123" in value for key, value in decoded.details if key == "TCP option"))
+        broken = decode(b"\0" * 12 + b"\x08\x00" + ip + tcp[:-1] + b"\x01")
+        self.assertIn("invalid", dict(broken.details)["TCP checksum status"])
+
+    def test_udp_checksum_ipv6_and_ipv4_disabled(self):
+        source = socket.inet_pton(socket.AF_INET6, "2001:db8::1")
+        destination = socket.inet_pton(socket.AF_INET6, "2001:db8::2")
+        udp = bytearray(struct.pack("!HHHH", 40000, 53, 11, 0) + b"abc")
+        pseudo = source + destination + struct.pack("!I3xB", len(udp), 17)
+        struct.pack_into("!H", udp, 6, _checksum(pseudo + udp))
+        ip6 = struct.pack("!IHBB16s16s", 0x60000000, len(udp), 17, 64, source, destination)
+        decoded = decode(b"\0" * 12 + b"\x86\xdd" + ip6 + udp)
+        self.assertEqual(dict(decoded.details)["UDP checksum status"], "valid")
+        ip4 = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 31, 1, 0, 64, 17, 0,
+                          socket.inet_aton("192.0.2.1"), socket.inet_aton("198.51.100.2"))
+        udp[6:8] = b"\0\0"
+        decoded = decode(b"\0" * 12 + b"\x08\x00" + ip4 + udp)
+        self.assertEqual(dict(decoded.details)["UDP checksum status"], "disabled (IPv4)")
+
     def test_stream_preview_uses_hex_for_binary(self):
         label, preview = stream_preview(b"POST / HTTP/1.1\r\n\r\n\x00\xff\x01")
         self.assertIn("十六进制", label)

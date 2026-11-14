@@ -14,8 +14,9 @@ from pcap_backend import Pcap
 from pcap_file import read_pcap, write_pcap
 from protocols import Decoded, decode
 from tcp_streams import FlowTracker
-from application_protocols import parse_dns_tcp_stream
+from application_protocols import parse_dns_tcp_stream, parse_http_stream
 from process_connections import ProcessConnections
+from display_expression import compile_display_expression
 
 
 MAX_PACKETS = 20000
@@ -69,9 +70,20 @@ class SnifferApp(tk.Tk):
         self.events: queue.Queue = queue.Queue(maxsize=5000)
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
-        self.dropped = 0
-        self.connections = {}
+        self.process_worker: threading.Thread | None = None
+        self.process_stop = threading.Event()
+        self.ui_dropped = 0
+        self.kernel_drop = 0
+        self.kernel_ifdrop = 0
+        self.capturing = False
+        self.applied_filter = ""
+        self.connections: dict = {}
+        self.connections_lock = threading.Lock()
+        self.connections_generation = 0
+        self.seen_generation = 0
         self.process_notice = ""
+        self.expression_predicate = compile_display_expression("")
+        self.expression_error = ""
         self._build_ui()
         self.after(100, self._drain)
         self.after(150, self._load_devices)
@@ -101,16 +113,25 @@ class SnifferApp(tk.Tk):
         filterbar.pack(fill="x")
         ttk.Label(filterbar, text="捕获过滤 BPF").pack(side="left")
         self.capture_filter = tk.StringVar()
-        ttk.Entry(filterbar, textvariable=self.capture_filter, width=34).pack(side="left", padx=(5, 16))
+        ttk.Entry(filterbar, textvariable=self.capture_filter, width=26).pack(side="left", padx=(5, 2))
+        self.filter_hint = tk.StringVar(value="")
+        self.filter_hint_label = ttk.Label(filterbar, textvariable=self.filter_hint, foreground="#666666")
+        self.filter_hint_label.pack(side="left", padx=(0, 12))
+        self.capture_filter.trace_add("write", lambda *_: self._update_filter_hint())
         ttk.Label(filterbar, text="显示协议").pack(side="left")
         self.display_filter = tk.StringVar(value="All")
         box = ttk.Combobox(filterbar, textvariable=self.display_filter, values=FILTERS, width=10, state="readonly")
         box.pack(side="left", padx=5)
         box.bind("<<ComboboxSelected>>", lambda _: self._refresh_list())
-        ttk.Label(filterbar, text="显示搜索 (src:/dst:/info:)").pack(side="left", padx=(12, 0))
-        self.search = tk.StringVar()
-        self.search.trace_add("write", lambda *_: self._refresh_list())
-        ttk.Entry(filterbar, textvariable=self.search, width=28).pack(side="left", padx=5)
+        expression_bar = ttk.Frame(self, padding=(8, 0, 8, 6))
+        expression_bar.pack(fill="x")
+        ttk.Label(expression_bar, text="显示过滤").pack(side="left")
+        self.display_expression = tk.StringVar()
+        self.display_expression.trace_add("write", lambda *_: self._expression_changed())
+        ttk.Entry(expression_bar, textvariable=self.display_expression).pack(side="left", fill="x", expand=True, padx=5)
+        self.expression_hint = tk.StringVar(value="例：syn；info:syn；tcp and port 80")
+        ttk.Label(expression_bar, textvariable=self.expression_hint).pack(side="left")
+        self._expression_changed()
 
         vertical = ttk.Panedwindow(self, orient="vertical")
         vertical.pack(fill="both", expand=True, padx=8)
@@ -168,38 +189,45 @@ class SnifferApp(tk.Tk):
         if self.packets:
             self._clear()
         self.stop_event.clear()
+        self.kernel_drop = 0
+        self.kernel_ifdrop = 0
+        self.ui_dropped = 0
+        self.applied_filter = self.capture_filter.get().strip()
+        with self.connections_lock:
+            self.connections = {}
+            self.connections_generation += 1
+        self.seen_generation = -1
+        self.capturing = True
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
-        self.worker = threading.Thread(target=self._capture, args=(self.devices[index].name, self.capture_filter.get()), daemon=True)
+        self._update_filter_hint()
+        self.status.set(f"正在开始抓包 | 捕获过滤 {self.applied_filter or '全量'} | {self._counters()}")
+        self.worker = threading.Thread(target=self._capture, args=(self.devices[index].name, self.applied_filter), daemon=True)
         self.worker.start()
+        self.process_worker = threading.Thread(target=self._watch_processes, daemon=True)
+        self.process_worker.start()
 
     def _capture(self, name: str, expression: str) -> None:
         capture = None
         try:
             capture = self.pcap.open(name, expression)
             self.events.put(("linktype", capture.linktype))
-            try:
-                process_lookup = ProcessConnections()
-            except RuntimeError as exc:
-                process_lookup = None
-                self.events.put(("process_error", str(exc)))
-            next_lookup = 0.0
+            next_stats = 0.0
             while not self.stop_event.is_set():
                 item = capture.next_packet()
                 if item:
                     try:
                         self.events.put_nowait(("packet", item))
                     except queue.Full:
-                        self.dropped += 1
-                if process_lookup and time.monotonic() >= next_lookup:
-                    try:
-                        self.events.put_nowait(("connections", process_lookup.snapshot()))
-                    except queue.Full:
-                        pass
-                    except (OSError, ValueError) as exc:
-                        self.events.put(("process_error", f"进程关联暂不可用：{exc}"))
-                        process_lookup = None
-                    next_lookup = time.monotonic() + 0.5
+                        self.ui_dropped += 1
+                if time.monotonic() >= next_stats:
+                    stats = capture.stats()
+                    if stats:
+                        try:
+                            self.events.put_nowait(("stats", stats))
+                        except queue.Full:
+                            pass
+                    next_stats = time.monotonic() + 0.5
         except Exception as exc:
             self.events.put(("error", str(exc)))
         finally:
@@ -207,11 +235,53 @@ class SnifferApp(tk.Tk):
                 capture.close()
             self.events.put(("stopped", None))
 
+    def _watch_processes(self) -> None:
+        """Look up TCP owners on its own thread so capture never blocks on it."""
+        try:
+            lookup = ProcessConnections()
+        except RuntimeError as exc:
+            self.events.put(("process_error", str(exc)))
+            return
+        while not self.stop_event.is_set():
+            try:
+                snapshot = lookup.snapshot()
+            except (OSError, ValueError) as exc:
+                self.events.put(("process_error", f"进程关联暂不可用：{exc}"))
+                return
+            with self.connections_lock:
+                self.connections = snapshot
+                self.connections_generation += 1
+            self.stop_event.wait(1.0)
+
     def _stop(self) -> None:
         self.stop_event.set()
         self.status.set("正在停止抓包…")
 
+    def _counters(self) -> str:
+        text = f"已存 {len(self.packets)} 包 | 驱动丢包 {self.kernel_drop}"
+        if self.kernel_ifdrop:
+            text += f"（网卡侧另计 {self.kernel_ifdrop}）"
+        return text + f" | 界面丢弃 {self.ui_dropped}"
+
+    def _update_filter_hint(self) -> None:
+        """The capture filter is only compiled when capture starts."""
+        current = self.capture_filter.get().strip()
+        if not self.capturing:
+            self.filter_hint.set("")
+            return
+        if current == self.applied_filter:
+            shown = self.applied_filter if len(self.applied_filter) <= 18 else self.applied_filter[:17] + "…"
+            self.filter_hint.set(f"已生效：{shown or '全量'}")
+            self.filter_hint_label.configure(foreground="#3a6b35")
+        else:
+            self.filter_hint.set("已修改，停止后重开才生效")
+            self.filter_hint_label.configure(foreground="#b35c00")
+
+    def _capture_status(self) -> str:
+        return f"正在抓包 | 链路类型 {self.linktype} | 捕获过滤 {self.applied_filter or '全量'} | {self._counters()}"
+
     def _drain(self) -> None:
+        refresh_needed = False
         for _ in range(250):
             try:
                 kind, value = self.events.get_nowait()
@@ -219,7 +289,7 @@ class SnifferApp(tk.Tk):
                 break
             if kind == "linktype":
                 self.linktype = value
-                self.status.set(f"正在抓包 | 链路类型 {value}")
+                self.status.set(self._capture_status())
             elif kind == "packet":
                 stamp, data, original = value
                 if len(self.packets) < MAX_PACKETS:
@@ -229,36 +299,74 @@ class SnifferApp(tk.Tk):
                     flow = self.flows.add(stamp, index, decoded)
                     if flow and self.connections:
                         self.flows.attribute_flow(flow, self.connections)
+                    changed = self._tag_flow_http(flow) if flow and decoded.tcp_payload else set()
+                    refresh_needed |= bool(changed)
                     self._add_row(index)
                 else:
-                    self.dropped += 1
+                    self.ui_dropped += 1
+            elif kind == "stats":
+                self.kernel_drop = value.get("drop", 0)
+                self.kernel_ifdrop = value.get("ifdrop", 0)
+                if self.capturing:
+                    self.status.set(self._capture_status())
             elif kind == "error":
                 self.status.set(value)
                 messagebox.showerror("抓包失败", value)
-            elif kind == "connections":
-                self.connections = value
-                self.flows.attribute(value)
             elif kind == "process_error":
                 self.process_notice = value
                 self.status.set(value)
             elif kind == "stopped":
+                self.capturing = False
                 self.start_button.configure(state="normal")
                 self.stop_button.configure(state="disabled")
-                self.status.set(f"已停止 | 已保存 {len(self.packets)} 包 | 丢弃 {self.dropped} 包")
+                self._update_filter_hint()
+                self.status.set(f"已停止 | 捕获过滤 {self.applied_filter or '全量'} | {self._counters()}")
+        if refresh_needed:
+            self._refresh_list()
+        with self.connections_lock:
+            generation = self.connections_generation
+            connections = self.connections
+        if generation != self.seen_generation:
+            self.seen_generation = generation
+            if connections:
+                self.flows.attribute(connections)
         self.after(100, self._drain)
+
+    def _tag_flow_http(self, flow) -> set[int]:
+        changed = set()
+        for direction in flow.directions.values():
+            data, _, sources = direction.reassemble_with_sources()
+            for message in parse_http_stream(data):
+                first, last = message.offset, message.offset + message.size
+                if not data or first >= last:
+                    continue
+                for start, end, index in sources:
+                    if start < last and first < end and "HTTP" not in self.packets[index].decoded.tags:
+                        decoded = self.packets[index].decoded
+                        decoded.tags.add("HTTP")
+                        decoded.protocol = "HTTP"
+                        decoded.info = message.start_line + " (TCP stream)"
+                        decoded.details.append(("HTTP stream", message.start_line))
+                        changed.add(index)
+        return changed
+
+    def _expression_changed(self) -> None:
+        try:
+            self.expression_predicate = compile_display_expression(self.display_expression.get())
+            self.expression_error = ""
+            self.expression_hint.set("例：syn；info:syn；tcp and port 80")
+            self._refresh_list()
+        except ValueError as exc:
+            self.expression_error = str(exc)
+            self.expression_hint.set("表达式错误：" + str(exc))
 
     def _matches(self, packet: Packet) -> bool:
         protocol = self.display_filter.get()
         if protocol != "All" and protocol not in packet.decoded.tags:
             return False
-        search = self.search.get().strip().lower()
-        if search.startswith("src:"):
-            return search[4:].strip() in packet.decoded.source.lower()
-        if search.startswith("dst:"):
-            return search[4:].strip() in packet.decoded.destination.lower()
-        if search.startswith("info:"):
-            return search[5:].strip() in packet.decoded.info.lower()
-        return not search or search in " ".join((packet.decoded.source, packet.decoded.destination, packet.decoded.protocol, packet.decoded.info)).lower()
+        if not self.expression_predicate(packet.decoded):
+            return False
+        return True
 
     def _add_row(self, index: int) -> None:
         packet = self.packets[index]
@@ -270,9 +378,14 @@ class SnifferApp(tk.Tk):
     def _refresh_list(self) -> None:
         if not hasattr(self, "table"):
             return
+        selected = self.table.selection()
+        position = self.table.yview()[0]
         self.table.delete(*self.table.get_children())
         for index in range(len(self.packets)):
             self._add_row(index)
+        if selected and self.table.exists(selected[0]):
+            self.table.selection_set(selected[0])
+        self.table.yview_moveto(position)
 
     def _selection(self, _event) -> None:
         selection = self.table.selection()
@@ -293,9 +406,14 @@ class SnifferApp(tk.Tk):
             return
         self.packets.clear()
         self.flows.clear()
-        self.connections = {}
+        with self.connections_lock:
+            self.connections = {}
+            self.connections_generation += 1
+        self.seen_generation = -1
         self.process_notice = ""
-        self.dropped = 0
+        self.ui_dropped = 0
+        self.kernel_drop = 0
+        self.kernel_ifdrop = 0
         self._refresh_list()
         self.details.delete(*self.details.get_children())
         self.bytes_view.configure(state="normal")
@@ -318,7 +436,9 @@ class SnifferApp(tk.Tk):
             self.linktype = linktype
             self.packets = [Packet(stamp, data, original, decode(data, linktype)) for stamp, data, original in items]
             for index, packet in enumerate(self.packets):
-                self.flows.add(packet.stamp, index, packet.decoded)
+                flow = self.flows.add(packet.stamp, index, packet.decoded)
+                if flow:
+                    self._tag_flow_http(flow)
             self._refresh_list()
             self.status.set(f"已打开 {len(items)} 包 | 链路类型 {linktype}")
         except Exception as exc:

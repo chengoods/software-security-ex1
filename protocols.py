@@ -32,6 +32,46 @@ def _mac(raw: bytes) -> str:
     return ":".join(f"{x:02x}" for x in raw)
 
 
+def _checksum(data: bytes) -> int:
+    if len(data) & 1:
+        data += b"\0"
+    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
+def _tcp_options(raw: bytes) -> list[tuple[str, str]]:
+    result = []
+    at = 0
+    while at < len(raw):
+        kind = raw[at]
+        if kind == 0:
+            break
+        if kind == 1:
+            at += 1
+            continue
+        if at + 2 > len(raw) or raw[at + 1] < 2 or at + raw[at + 1] > len(raw):
+            result.append(("TCP option", "malformed"))
+            break
+        value = raw[at + 2:at + raw[at + 1]]
+        if kind == 2 and len(value) == 2:
+            label = "MSS=%d" % struct.unpack("!H", value)[0]
+        elif kind == 3 and len(value) == 1:
+            label = "Window scale=%d" % value[0]
+        elif kind == 4 and not value:
+            label = "SACK permitted"
+        elif kind == 5 and len(value) % 8 == 0:
+            label = "SACK " + ", ".join("%d-%d" % struct.unpack_from("!II", value, i) for i in range(0, len(value), 8))
+        elif kind == 8 and len(value) == 8:
+            label = "Timestamp TSval=%d TSecr=%d" % struct.unpack("!II", value)
+        else:
+            label = "type=%d data=%s" % (kind, value.hex())
+        result.append(("TCP option", label))
+        at += raw[at + 1]
+    return result
+
+
 def _dns_name(raw: bytes, at: int) -> str:
     labels, seen = [], set()
     for _ in range(32):
@@ -107,6 +147,10 @@ def decode(raw: bytes, linktype: int = 1) -> Decoded:
             out.source, out.destination = _ip(raw[at + 12:at + 16]), _ip(raw[at + 16:at + 20])
             out.tags.add("IPv4")
             out.details += [("IPv4 source", out.source), ("IPv4 destination", out.destination), ("TTL", str(raw[at + 8])), ("IP length", str(total)), ("IP protocol", str(proto))]
+            ip_header = raw[at:at + ihl]
+            out.details.append(("IPv4 header checksum", "0x%04x (%s)" % (struct.unpack_from("!H", raw, at + 10)[0], "valid" if _checksum(ip_header) == 0 else "invalid; possible checksum offload on local capture")))
+            source_bytes, destination_bytes = raw[at + 12:at + 16], raw[at + 16:at + 20]
+            fragmented = bool(frag & 0x3FFF)
             end = min(len(raw), at + total)
             at += ihl
             if frag & 0x1FFF:
@@ -120,7 +164,10 @@ def decode(raw: bytes, linktype: int = 1) -> Decoded:
             out.source, out.destination = _ip(raw[at + 8:at + 24]), _ip(raw[at + 24:at + 40])
             out.tags.add("IPv6")
             out.details += [("IPv6 source", out.source), ("IPv6 destination", out.destination), ("Hop limit", str(raw[at + 7])), ("Next header", str(proto))]
-            end = min(len(raw), at + 40 + length)
+            source_bytes, destination_bytes = raw[at + 8:at + 24], raw[at + 24:at + 40]
+            fragmented = False
+            ipv6_payload_end = at + 40 + length
+            end = min(len(raw), ipv6_payload_end)
             at += 40
             for _ in range(8):
                 if proto not in (0, 43, 44, 60, 51):
@@ -134,6 +181,8 @@ def decode(raw: bytes, linktype: int = 1) -> Decoded:
                 if proto == 44 and struct.unpack_from("!H", raw, at + 2)[0] & 0xFFF8:
                     out.protocol, out.info = "IPv6", "Noninitial fragment"
                     return out
+                if proto == 44:
+                    fragmented = bool(raw[at + 3] & 1)
                 out.details.append(("IPv6 extension", f"type={proto} bytes={size}"))
                 proto, at = next_proto, at + size
         else:
@@ -161,9 +210,30 @@ def decode(raw: bytes, linktype: int = 1) -> Decoded:
                 flags = ",".join(label for bit, label in ((1, "FIN"), (2, "SYN"), (4, "RST"), (8, "PSH"), (16, "ACK"), (32, "URG")) if data[13] & bit)
                 out.info += f" [{flags}] Seq={seq} Ack={ack}"
                 out.details += [("TCP sequence", str(seq)), ("TCP acknowledgment", str(ack)), ("TCP flags", flags)]
+                out.details += [("TCP window", str(struct.unpack_from("!H", data, 14)[0])), ("TCP checksum", "0x%04x" % struct.unpack_from("!H", data, 16)[0])]
+                out.details += _tcp_options(data[20:hlen])
             else:
                 hlen = 8
                 out.details.append(("UDP length", str(struct.unpack_from("!H", data, 4)[0])))
+                out.details.append(("UDP checksum", "0x%04x" % struct.unpack_from("!H", data, 6)[0]))
+            checksum = struct.unpack_from("!H", data, 16 if proto == 6 else 6)[0]
+            declared = (total - ihl) if kind == 0x0800 else (ipv6_payload_end - at)
+            if proto == 17:
+                declared = struct.unpack_from("!H", data, 4)[0]
+            if proto == 17 and checksum == 0 and kind == 0x0800:
+                verdict = "disabled (IPv4)"
+            elif len(data) < declared or fragmented or declared < hlen:
+                verdict = "unverified (truncated or fragmented)"
+            elif proto == 17 and checksum == 0:
+                verdict = "invalid (IPv6 requires a checksum)"
+            else:
+                pseudo = source_bytes + destination_bytes
+                if kind == 0x0800:
+                    pseudo += struct.pack("!BBH", 0, proto, declared)
+                else:
+                    pseudo += struct.pack("!I3xB", declared, proto)
+                verdict = "valid" if _checksum(pseudo + data[:declared]) == 0 else "invalid; possible checksum offload on local capture"
+            out.details.append((name + " checksum status", verdict))
             payload = data[hlen:]
             if proto == 6:
                 out.tcp_payload = payload

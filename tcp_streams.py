@@ -18,7 +18,7 @@ FlowKey = Tuple[Endpoint, Endpoint]
 @dataclass
 class Direction:
     endpoint: Endpoint
-    segments: list[tuple[int, bytes]] = field(default_factory=list)
+    segments: list[tuple[int, bytes, int]] = field(default_factory=list)
     base: int | None = None
     seen_syn: bool = False
     syn_sequence: int | None = None
@@ -26,7 +26,7 @@ class Direction:
     packet_count: int = 0
     wire_bytes: int = 0
 
-    def add(self, sequence: int, payload: bytes, syn: bool) -> None:
+    def add(self, sequence: int, payload: bytes, syn: bool, index: int) -> None:
         self.packet_count += 1
         self.wire_bytes += len(payload)
         if syn:
@@ -38,7 +38,7 @@ class Direction:
             else:
                 earlier = (self.base - sequence + 2**31) % 2**32 - 2**31
                 if earlier > 0:
-                    self.segments = [(at + earlier, data) for at, data in self.segments]
+                    self.segments = [(at + earlier, data, packet) for at, data, packet in self.segments]
                     self.base = sequence
         if not payload:
             return
@@ -54,7 +54,7 @@ class Direction:
                 payload = payload[-start:]
                 start = 0
             else:
-                self.segments = [(at - start, data) for at, data in self.segments]
+                self.segments = [(at - start, data, packet) for at, data, packet in self.segments]
                 self.base = sequence
                 start = 0
         if start >= MAX_DIRECTION_BYTES:
@@ -63,25 +63,32 @@ class Direction:
         if start + len(payload) > MAX_DIRECTION_BYTES:
             payload = payload[:MAX_DIRECTION_BYTES - start]
             self.truncated = True
-        self.segments.append((start, payload))
+        self.segments.append((start, payload, index))
 
-    def reassemble(self) -> tuple[bytes, list[tuple[int, int]]]:
+    def reassemble_with_sources(self) -> tuple[bytes, list[tuple[int, int]], list[tuple[int, int, int]]]:
         """Return contiguous prefix and uncovered offsets after the first gap."""
         if not self.segments:
-            return b"", []
+            return b"", [], []
         output = bytearray()
         gaps = []
+        sources = []
         end = 0
-        for start, data in sorted(self.segments, key=lambda item: item[0]):
+        for start, data, packet in sorted(self.segments, key=lambda item: item[0]):
             if start > end:
                 gaps.append((end, start))
                 end = start
             overlap = end - start
             if overlap < len(data):
                 if not gaps:
+                    offset = len(output)
                     output.extend(data[overlap:])
+                    sources.append((offset, len(output), packet))
                 end += len(data) - overlap
-        return bytes(output), gaps
+        return bytes(output), gaps, sources
+
+    def reassemble(self) -> tuple[bytes, list[tuple[int, int]]]:
+        data, gaps, _ = self.reassemble_with_sources()
+        return data, gaps
 
     @property
     def http_messages(self) -> list[HttpMessage]:
@@ -103,7 +110,7 @@ class Flow:
     def add(self, stamp: float, index: int, decoded: Decoded) -> None:
         endpoint = (decoded.source, decoded.source_port)
         direction = self.directions[endpoint]
-        direction.add(decoded.tcp_sequence, decoded.tcp_payload, bool(decoded.tcp_flags & 2))
+        direction.add(decoded.tcp_sequence, decoded.tcp_payload, bool(decoded.tcp_flags & 2), index)
         self.packet_indices.append(index)
         if not self.start_time:
             self.start_time = stamp

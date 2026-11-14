@@ -26,6 +26,10 @@ class BpfProgram(C.Structure):
     _fields_ = [("bf_len", C.c_uint), ("bf_insns", C.c_void_p)]
 
 
+class PcapStat(C.Structure):
+    _fields_ = [("ps_recv", C.c_uint), ("ps_drop", C.c_uint), ("ps_ifdrop", C.c_uint)]
+
+
 @dataclass(frozen=True)
 class Device:
     name: str
@@ -68,6 +72,12 @@ class Pcap:
         lib.pcap_setfilter.restype = C.c_int
         lib.pcap_freecode.argtypes = [C.POINTER(BpfProgram)]
         lib.pcap_lib_version.restype = C.c_char_p
+        self.has_stats = True
+        try:
+            lib.pcap_stats.argtypes = [C.c_void_p, C.POINTER(PcapStat)]
+            lib.pcap_stats.restype = C.c_int
+        except AttributeError:
+            self.has_stats = False
 
     def version(self) -> str:
         return _decode(self.lib.pcap_lib_version())
@@ -105,17 +115,30 @@ class Pcap:
                         raise RuntimeError("设置捕获过滤失败：" + _decode(self.lib.pcap_geterr(handle)))
                 finally:
                     self.lib.pcap_freecode(C.byref(program))
-            return Capture(self.lib, handle, linktype)
+            return Capture(self.lib, handle, linktype, self.has_stats)
         except Exception:
             self.lib.pcap_close(handle)
             raise
 
 
 class Capture:
-    def __init__(self, lib, handle: int, linktype: int) -> None:
+    def __init__(self, lib, handle: int, linktype: int, has_stats: bool = True) -> None:
         self.lib = lib
         self.handle = handle
         self.linktype = linktype
+        self.has_stats = has_stats
+
+    def stats(self) -> dict[str, int] | None:
+        """Driver counters. ps_drop counts packets lost before reaching the app."""
+        if not self.handle or not self.has_stats:
+            return None
+        stat = PcapStat()
+        try:
+            if self.lib.pcap_stats(self.handle, C.byref(stat)) != 0:
+                return None
+        except (AttributeError, OSError):
+            return None
+        return {"recv": stat.ps_recv, "drop": stat.ps_drop, "ifdrop": stat.ps_ifdrop}
 
     def next_packet(self) -> tuple[float, bytes, int] | None:
         header = C.POINTER(PacketHeader)()
